@@ -2,8 +2,9 @@
 
 > **Target:** Azure B2ast (2 vCPU / 1 GB RAM) — Japan East region  
 > **Client Location:** Qingdao, China  
-> **Stack:** Unbound + DoT/DoH + UFW + fail2ban + auditd  
-> **Compliance:** CIS Benchmarks (Ubuntu 22.04) · PCI-DSS v4.0
+> **Stack:** Unbound + DoT (port 853) + UFW + fail2ban + auditd  
+> **Compliance:** CIS Benchmarks (Ubuntu 22.04) · PCI-DSS v4.0  
+> **Nginx:** Install separately with OWASP ModSecurity CRS for the DoH reverse proxy
 
 ---
 
@@ -11,14 +12,16 @@
 
 1. [Architecture Overview](#1-architecture-overview)
 2. [Prerequisites](#2-prerequisites)
-3. [Phase 1 — System Security Hardening (CIS / PCI-DSS)](#3-phase-1--system-security-hardening)
-4. [Phase 2 — Network & Kernel Optimization](#4-phase-2--network--kernel-optimization)
-5. [Phase 3 — Unbound DNS Configuration](#5-phase-3--unbound-dns-configuration)
-6. [Phase 4 — DoT / DoH Setup](#6-phase-4--dot--doh-setup)
-7. [Phase 5 — Automated Deployment](#7-phase-5--automated-deployment)
-8. [Phase 6 — Verification & Compliance Checklist](#8-phase-6--verification--compliance-checklist)
-9. [Memory & Resource Reference](#9-memory--resource-reference)
-10. [Troubleshooting](#10-troubleshooting)
+3. [Quick Start — Automated Deployment](#3-quick-start--automated-deployment)
+4. [Phase 1 — System Security Hardening](#4-phase-1--system-security-hardening)
+5. [Phase 2 — UFW Firewall (runs before sysctl)](#5-phase-2--ufw-firewall)
+6. [Phase 3 — Network & Kernel Optimisation](#6-phase-3--network--kernel-optimisation)
+7. [Phase 4 — Unbound DNS Configuration](#7-phase-4--unbound-dns-configuration)
+8. [Phase 5 — DNS over TLS Setup](#8-phase-5--dns-over-tls-setup)
+9. [Phase 6 — Verification & Compliance Checklist](#9-phase-6--verification--compliance-checklist)
+10. [Memory & Resource Reference](#10-memory--resource-reference)
+11. [Troubleshooting](#11-troubleshooting)
+12. [File Structure](#12-file-structure)
 
 ---
 
@@ -27,72 +30,112 @@
 ```
 Qingdao Client
      │
-     │  Encrypted tunnel (DoT :853 / DoH :443)
+     │  Encrypted DoT (TCP :853)  ─── or ───  DoH via Nginx (:443 + OWASP CRS)
      ▼
 Azure Japan East — B2ast VM (2 vCPU / 1 GB RAM)
-┌─────────────────────────────────────────────────┐
-│  UFW Firewall  (22/tcp · 53/tcp+udp · 853/tcp · 443/tcp)
-│  ┌───────────────────────────────────────────┐  │
-│  │  Unbound (recursive resolver)             │  │
-│  │  · 2 threads (one per vCPU)               │  │
-│  │  · msg-cache 64 MB + rrset-cache 128 MB   │  │
-│  │  · QNAME minimisation (privacy)           │  │
-│  │  · DNSSEC validation                      │  │
-│  │  · Rate-limit 1000 QPS (anti-amplification│  │
-│  └───────────────────────────────────────────┘  │
-│  fail2ban · auditd · AppArmor                   │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  UFW Firewall  (22/tcp · 53/tcp+udp · 853/tcp · 443/tcp) │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Unbound (recursive resolver)                      │  │
+│  │  · 2 threads (one per vCPU)                       │  │
+│  │  · msg-cache 64 MB + rrset-cache 128 MB           │  │
+│  │  · QNAME minimisation (privacy, RFC 7816)         │  │
+│  │  · DNSSEC validation                              │  │
+│  │  · Rate-limit 1000 QPS/zone (anti-amplification)  │  │
+│  │  · Serve-expired 1 h (China–Japan resilience)     │  │
+│  └────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────┐ │
+│  │  Nginx + OWASP ModSecurity CRS (user-installed)     │ │
+│  │  Reverse proxy for DNS over HTTPS (:443 → :8053)   │ │
+│  └──────────────────────────────────────────────────────┘ │
+│  fail2ban · auditd · AppArmor                            │
+└──────────────────────────────────────────────────────────┘
      │
-     ▼  Plain UDP/TCP (inside Azure datacenter)
-  Root servers / TLD servers / Authoritative servers
+     │  Plain UDP/TCP (inside Azure datacenter)
+     ▼
+  Root / TLD / Authoritative servers
 ```
 
 ### Why this stack?
 
 | Concern | Solution |
 |---|---|
-| Cross-border DNS poisoning | DoT (port 853) encrypts the query end-to-end |
-| 1 GB RAM OOM risk | Unbound cache strictly capped at ~192 MB total |
-| High latency (China–Japan) | BBR congestion control + UDP buffer tuning |
-| CIS Benchmark compliance | SSH hardening, UFW, auditd, AppArmor |
-| PCI-DSS logging requirement | auditd rules, syslog forwarding, log-queries |
-| DNS amplification attacks | Rate-limiting + access-control ACLs |
+| Cross-border DNS poisoning | DoT (port 853) end-to-end encryption; Nginx DoH with OWASP CRS |
+| 1 GB RAM OOM risk | Unbound cache strictly capped at ~192 MB total; `vm.overcommit_memory=0` |
+| High latency (China–Japan) | BBR congestion control + UDP/TCP buffer tuning |
+| CIS Benchmark compliance | SSH hardening, UFW, auditd, AppArmor, sysctl hardening |
+| PCI-DSS logging requirement | auditd rules, syslog forwarding, `log-queries: yes` |
+| DNS amplification attacks | Rate-limiting (1000 QPS/zone, 100 QPS/IP) + access-control ACLs |
+| nf_conntrack sysctl ordering | UFW enabled **before** sysctl so module is loaded when keys apply |
 
 ---
 
 ## 2. Prerequisites
 
-- **OS:** Ubuntu 22.04 LTS (recommended) or Ubuntu 24.04 LTS
-- **Inbound ports** opened in the **Azure Network Security Group**:
-  - TCP 22 (SSH)
-  - TCP/UDP 53 (DNS)
-  - TCP 853 (DNS over TLS)
-  - TCP 443 (DNS over HTTPS)
-- A **domain name** pointing to the VM's public IP (required for TLS certificate)
+- **OS:** Ubuntu 22.04 LTS (kernel 5.15, Unbound ≥ 1.13)
+- **Azure NSG inbound rules** — open before deploying:
+
+  | Port | Protocol | Purpose |
+  |------|----------|---------|
+  | 22 | TCP | SSH management |
+  | 53 | TCP + UDP | Plain DNS |
+  | 853 | TCP | DNS over TLS (DoT) |
+  | 443 | TCP | DNS over HTTPS via Nginx (DoH) |
+  | 80 | TCP | ACME HTTP-01 challenge (temporary, during `setup-tls.sh`) |
+
+- A **domain name** with an A record pointing to the VM's public IP (required for TLS)
 - Root / sudo access
+- SSH public key authentication configured **before** running `deploy.sh`
+  (password auth will be disabled by the script)
 
 ---
 
-## 3. Phase 1 — System Security Hardening
-
-### 3.1 System update & package installation
+## 3. Quick Start — Automated Deployment
 
 ```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y \
-    unbound \
-    ufw \
-    fail2ban \
-    auditd \
-    apparmor-profiles \
-    certbot \
-    curl \
-    jq
+# 1. Clone the repository on the target VM
+git clone --depth 1 https://github.com/hyangyao/dns.git
+cd dns
+
+# 2. Full deployment: packages, UFW, sysctl, SSH, auditd, Unbound, fail2ban
+sudo bash scripts/deploy.sh
+
+# 3. Whitelist your client IP in Unbound
+sudo nano /etc/unbound/unbound.conf
+# Uncomment and set: access-control: <YOUR_IP>/32 allow
+sudo systemctl reload unbound
+
+# 4. Enable DNS over TLS (requires a domain pointing to this server)
+sudo bash scripts/setup-tls.sh dns.example.com admin@example.com
+
+# 5. Verify the full deployment
+sudo bash scripts/health-check.sh
 ```
 
-### 3.2 SSH hardening (CIS Section 5.2)
+> **Nginx + OWASP CRS (DoH):** Install Nginx and OWASP ModSecurity Core Rule Set
+> separately. See [Phase 5 §5.3](#53-doh-via-nginx-reference-config) for the
+> reverse-proxy configuration reference.
 
-Edit `/etc/ssh/sshd_config`:
+---
+
+## 4. Phase 1 — System Security Hardening
+
+### 4.1 Packages installed by deploy.sh
+
+| Package | Purpose |
+|---------|---------|
+| `unbound` | Recursive DNS resolver |
+| `ufw` | Uncomplicated firewall |
+| `fail2ban` | Brute-force protection |
+| `auditd` | Kernel-level audit logging (PCI-DSS Req. 10) |
+| `apparmor-profiles` | Mandatory access control |
+| `certbot` | Let's Encrypt TLS certificate management |
+| `dnsutils` | `dig`, `nslookup` for verification |
+| `curl`, `jq` | Utilities used by scripts |
+
+### 4.2 SSH hardening (CIS Section 5.2 / PCI-DSS Req. 8)
+
+Written to `/etc/ssh/sshd_config.d/99-hardened.conf`:
 
 ```text
 PermitRootLogin no
@@ -104,197 +147,186 @@ LoginGraceTime 60
 ClientAliveInterval 300
 ClientAliveCountMax 0
 AllowTcpForwarding no
-Banner /etc/issue.net
 ```
 
-```bash
-sudo systemctl restart sshd
-```
+The script validates with `sshd -t` before restarting to prevent lockouts.
 
-### 3.3 UFW Firewall rules (CIS 3.5 / PCI-DSS Req. 1)
+> ⚠️ Ensure your SSH public key is in `~/.ssh/authorized_keys` **before** running
+> `deploy.sh` — password authentication will be permanently disabled.
 
-```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw allow 22/tcp        # SSH
-sudo ufw allow 53/tcp        # DNS (TCP)
-sudo ufw allow 53/udp        # DNS (UDP)
-sudo ufw allow 853/tcp       # DoT
-sudo ufw allow 443/tcp       # DoH
-sudo ufw enable
-```
+### 4.3 auditd rules (PCI-DSS Req. 10)
 
-> **PCI-DSS Req 1.3:** Only allow ports explicitly required for business purposes. Remove any other rules.
+Written to `/etc/audit/rules.d/dns-server.rules`:
 
-### 3.4 fail2ban configuration
+| Rule | Trigger |
+|------|---------|
+| `-w /etc/unbound/ -p wa` | Any write or attribute change to Unbound config |
+| `-w /etc/passwd -p wa` | Identity file changes |
+| `-w /etc/ssh/sshd_config -p wa` | SSH configuration changes |
+| `-w /etc/sudoers -p wa` | Privilege escalation config changes |
+| `-a always,exit … execve uid=0` | Every root command execution |
 
-```bash
-# /etc/fail2ban/jail.local
-sudo tee /etc/fail2ban/jail.local <<'EOF'
+### 4.4 fail2ban (PCI-DSS Req. 8)
+
+```ini
 [DEFAULT]
-bantime  = 3600
-findtime = 600
-maxretry = 5
+bantime  = 3600    # 1-hour ban
+findtime = 600     # 10-minute detection window
+maxretry = 5       # 5 failures triggers a ban
 
 [sshd]
 enabled = true
-port    = ssh
-logpath = %(sshd_log)s
-backend = %(syslog_backend)s
-EOF
-
-sudo systemctl enable --now fail2ban
-```
-
-### 3.5 auditd rules (PCI-DSS Req. 10)
-
-```bash
-sudo tee /etc/audit/rules.d/dns-server.rules <<'EOF'
-# Monitor Unbound configuration changes
--w /etc/unbound/ -p wa -k dns_config_changes
-
-# Monitor identity files
--w /etc/passwd -p wa -k identity_changes
--w /etc/shadow -p wa -k identity_changes
--w /etc/group  -p wa -k identity_changes
-
-# Monitor SSH configuration
--w /etc/ssh/sshd_config -p wa -k sshd_config
-
-# Monitor sudo usage
--w /etc/sudoers -p wa -k sudoers_changes
--a always,exit -F arch=b64 -S execve -F uid=0 -k root_commands
-
-# Monitor network configuration
--w /etc/sysctl.conf -p wa -k sysctl_changes
--w /etc/sysctl.d/   -p wa -k sysctl_changes
-EOF
-
-sudo systemctl enable --now auditd
-sudo augenrules --load
 ```
 
 ---
 
-## 4. Phase 2 — Network & Kernel Optimization
+## 5. Phase 2 — UFW Firewall
 
-Apply the sysctl settings from `config/99-dns-optimize.conf`:
+> **Ordering note:** `deploy.sh` enables UFW **before** applying sysctl settings.
+> UFW's activation loads the `nf_conntrack` netfilter module into the kernel.
+> The `net.netfilter.nf_conntrack_*` sysctl keys in `99-dns-optimize.conf`
+> require this module to be present — applying them before UFW causes errors.
+
+Rules applied by `deploy.sh`:
 
 ```bash
-sudo cp config/99-dns-optimize.conf /etc/sysctl.d/99-dns-optimize.conf
-sudo sysctl -p /etc/sysctl.d/99-dns-optimize.conf
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp    # SSH
+ufw allow 53/tcp    # DNS TCP
+ufw allow 53/udp    # DNS UDP
+ufw allow 853/tcp   # DoT
+ufw allow 443/tcp   # DoH (Nginx)
+ufw enable
 ```
 
-Key parameters explained:
+> **PCI-DSS Req. 1.3:** Only ports explicitly required for business purposes are
+> opened. Remove any rules added by cloud provider defaults.
+
+---
+
+## 6. Phase 3 — Network & Kernel Optimisation
+
+Applied automatically by `deploy.sh` from `config/99-dns-optimize.conf`:
 
 | Parameter | Value | Reason |
 |---|---|---|
-| `tcp_congestion_control` | `bbr` | Reduces latency & improves throughput on lossy China–Japan cross-border links |
-| `default_qdisc` | `fq` | Required companion queue for BBR |
-| `rmem_max` / `wmem_max` | `4194304` (4 MB) | Larger UDP receive buffer prevents DNS query drops under burst load |
-| `tcp_syncookies` | `1` | Mitigates SYN flood attacks (CIS 3.3.2) |
-| `disable_ipv6` | `1` | Reduces attack surface (only if IPv6 is unused) |
-| `ip_forward` | `0` | Prevents the VM from acting as a router (PCI-DSS Req. 1) |
+| `tcp_congestion_control` | `bbr` | Reduces latency on lossy China–Japan links (1–5% packet loss) |
+| `default_qdisc` | `fq` | Required companion queue discipline for BBR |
+| `rmem_max` / `wmem_max` | `4 MB` | Matches Unbound `so-rcvbuf`/`so-sndbuf`; prevents DNS query drops |
+| `tcp_syncookies` | `1` | SYN flood mitigation (CIS 3.3.2) |
+| `ip_forward` | `0` | Prevents routing/amplification attacks (PCI-DSS Req. 1) |
+| `disable_ipv6` | `1` | Reduces attack surface (CIS 3.1.1); re-enable if needed |
+| `nf_conntrack_max` | `131072` | Prevents "table full" drops under high DNS UDP query load |
+| `vm.swappiness` | `10` | Strongly prefers RAM over swap |
+| `vm.overcommit_memory` | `0` | Heuristic mode — rejects unserviceable allocations on 1 GB host |
 
 ---
 
-## 5. Phase 3 — Unbound DNS Configuration
+## 7. Phase 4 — Unbound DNS Configuration
 
-Apply the configuration from `config/unbound.conf`:
-
-```bash
-# Backup original
-sudo cp /etc/unbound/unbound.conf /etc/unbound/unbound.conf.bak
-
-# Install the optimized configuration
-sudo cp config/unbound.conf /etc/unbound/unbound.conf
-
-# Download root hints
-sudo curl -sSo /var/lib/unbound/root.hints \
-    https://www.internic.net/domain/named.cache
-
-# Verify configuration
-sudo unbound-checkconf /etc/unbound/unbound.conf
-
-# Enable and start
-sudo systemctl enable --now unbound
-```
-
-### Memory budget breakdown (1 GB RAM)
+### Memory budget (1 GB RAM)
 
 | Component | Allocation |
 |---|---|
-| OS kernel + system processes | ~300 MB |
-| Unbound msg-cache | 64 MB |
-| Unbound rrset-cache | 128 MB |
-| Unbound key-cache + infra-cache | ~16 MB |
+| OS kernel + system services | ~300 MB |
+| Unbound `msg-cache-size` | 64 MB |
+| Unbound `rrset-cache-size` | 128 MB |
+| Unbound `key-cache-size` + infra-cache | ~20 MB |
 | Unbound threads + overhead | ~32 MB |
 | fail2ban + auditd + sshd | ~50 MB |
-| **Total** | **~590 MB** |
-| **Safety headroom** | **~410 MB** |
-
-This allocation ensures no OOM kills under normal recursive resolver workload.
+| **Total used** | **~594 MB** |
+| **Safety headroom** | **~406 MB** |
 
 ### Thread & slab tuning (2 vCPUs)
 
 ```
-num-threads: 2          # One thread per vCPU
-msg-cache-slabs: 2      # Must be a power of 2, >= num-threads
+num-threads: 2          # one thread per vCPU
+msg-cache-slabs: 2      # power of 2 ≥ num-threads; reduces mutex contention
 rrset-cache-slabs: 2
 infra-cache-slabs: 2
 key-cache-slabs: 2
 ```
 
-Slabs partition cache structures to reduce lock contention between threads.
-
 ### Security settings
 
 | Setting | Value | Standard |
 |---|---|---|
-| `hide-identity` | `yes` | CIS DNS 2.1 |
-| `hide-version` | `yes` | CIS DNS 2.1 |
-| `qname-minimisation` | `yes` | RFC 7816, privacy |
-| `harden-glue` | `yes` | Prevents cache poisoning |
-| `harden-dnssec-stripped` | `yes` | DNSSEC integrity |
-| `use-caps-for-id` | `yes` | 0x20 encoding anti-spoofing |
-| `ratelimit` | `1000` | Anti-amplification (PCI-DSS Req. 6) |
+| `hide-identity` | `yes` | CIS DNS 2.1 — prevents fingerprinting |
+| `hide-version` | `yes` | CIS DNS 2.1 — prevents version enumeration |
+| `qname-minimisation` | `yes` | RFC 7816 — minimises upstream query data |
+| `harden-glue` | `yes` | Prevents cache poisoning via glue records |
+| `harden-dnssec-stripped` | `yes` | Rejects responses stripping DNSSEC signatures |
+| `harden-below-nxdomain` | `yes` | RFC 8020 — NXDOMAIN cut for subdomains |
+| `harden-algo-downgrade` | `yes` | Prevents DNSSEC algorithm downgrade attacks |
+| `use-caps-for-id` | `yes` | 0x20 encoding — Kaminsky attack mitigation |
+| `ratelimit` | `1000` | Anti-amplification per zone (PCI-DSS Req. 6) |
+| `ip-ratelimit` | `100` | Anti-amplification per client IP |
+| `do-ip6` | `no` | Disabled to match sysctl; re-enable if IPv6 needed |
 
----
+> **Note on `harden-referral-path`:** Intentionally **not** enabled. It causes
+> false DNSSEC failures on legitimate domains whose NS referral paths are
+> unsigned — common with large CDN and cloud providers.
 
-## 6. Phase 4 — DoT / DoH Setup
+### Access control
 
-### 6.1 Obtain a TLS certificate (Let's Encrypt)
-
-```bash
-# Replace dns.example.com with your actual domain
-sudo certbot certonly --standalone \
-    --preferred-challenges http \
-    -d dns.example.com \
-    --agree-tos \
-    --email admin@example.com
-```
-
-### 6.2 Configure Unbound for DoT (port 853)
-
-Edit `config/unbound.conf` and replace the placeholder paths:
-
-```text
-# Interface already listens on port 853 via: interface: 0.0.0.0@853
-tls-service-key: "/etc/letsencrypt/live/dns.example.com/privkey.pem"
-tls-service-pem: "/etc/letsencrypt/live/dns.example.com/fullchain.pem"
-```
-
-Then reload Unbound:
+The default config refuses all external sources. Add your client IP:
 
 ```bash
+# Edit /etc/unbound/unbound.conf:
+access-control: 1.2.3.4/32 allow    # your Qingdao IP
+
 sudo systemctl reload unbound
 ```
 
-### 6.3 DoH via nginx reverse proxy (optional)
+### Remote control (Unix socket — no key files needed)
 
 ```bash
-sudo apt install -y nginx
-sudo tee /etc/nginx/sites-available/doh <<'EOF'
+sudo unbound-control stats_noreset
+sudo unbound-control reload
+sudo unbound-control flush_zone example.com
+```
+
+---
+
+## 8. Phase 5 — DNS over TLS Setup
+
+### 5.1 Automated (recommended)
+
+```bash
+sudo bash scripts/setup-tls.sh dns.example.com admin@example.com
+```
+
+This script: opens port 80 temporarily → runs `certbot --standalone` → closes
+port 80 → patches `unbound.conf` to activate DoT → validates and reloads Unbound
+→ installs a daily renewal cron job.
+
+### 5.2 Manual DoT setup
+
+```bash
+# 1. Obtain certificate (port 80 must be reachable)
+sudo ufw allow 80/tcp
+sudo certbot certonly --standalone --non-interactive --agree-tos \
+    --email admin@example.com -d dns.example.com
+sudo ufw delete allow 80/tcp
+
+# 2. In /etc/unbound/unbound.conf, uncomment:
+#    interface: 0.0.0.0@853
+#    tls-service-key: "/etc/letsencrypt/live/dns.example.com/privkey.pem"
+#    tls-service-pem: "/etc/letsencrypt/live/dns.example.com/fullchain.pem"
+#    tls-min-version: "TLSv1.2"
+
+# 3. Validate and reload
+sudo unbound-checkconf /etc/unbound/unbound.conf
+sudo systemctl reload unbound
+```
+
+### 5.3 DoH via Nginx reference config
+
+Install Nginx with OWASP ModSecurity CRS separately, then use:
+
+```nginx
+# /etc/nginx/sites-available/doh
 server {
     listen 443 ssl http2;
     server_name dns.example.com;
@@ -302,170 +334,146 @@ server {
     ssl_certificate     /etc/letsencrypt/live/dns.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/dns.example.com/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
 
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+
+    # Proxy DoH to Unbound's DoH listener (configure Unbound on 127.0.0.1:8053)
     location /dns-query {
         proxy_pass       http://127.0.0.1:8053;
         proxy_set_header Host $host;
-        add_header       Strict-Transport-Security "max-age=31536000" always;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_http_version 1.1;
+        proxy_read_timeout 30s;
     }
 }
-EOF
-
-sudo ln -sf /etc/nginx/sites-available/doh /etc/nginx/sites-enabled/doh
-sudo nginx -t && sudo systemctl reload nginx
 ```
 
-### 6.4 Certificate auto-renewal
+### 5.4 Certificate auto-renewal
 
-```bash
-sudo tee /etc/cron.d/certbot-renew <<'EOF'
-0 3 * * * root certbot renew --quiet --deploy-hook "systemctl reload unbound nginx"
-EOF
+`setup-tls.sh` installs `/etc/cron.d/certbot-renew-unbound`:
+
+```cron
+0 3 * * * root certbot renew --quiet --deploy-hook "systemctl reload unbound"
 ```
 
 ---
 
-## 7. Phase 5 — Automated Deployment
+## 9. Phase 6 — Verification & Compliance Checklist
 
-The `scripts/deploy.sh` script automates all phases above.
+### Automated health check
 
 ```bash
-# Clone the repository on the target VM
-git clone --depth 1 https://github.com/hyangyao/dns.git
-cd dns
-
-# Make the script executable
-chmod +x scripts/deploy.sh
-
-# Run as root (or with sudo)
-sudo bash scripts/deploy.sh
+sudo bash scripts/health-check.sh
 ```
 
-The script will:
-1. Update the system and install all required packages
-2. Apply sysctl network optimizations (BBR, buffer tuning)
-3. Configure UFW firewall rules
-4. Harden SSH configuration
-5. Set up auditd rules
-6. Install and configure Unbound
-7. Enable fail2ban
+Verifies: Unbound status · DNS resolution · DNSSEC validation · version hiding ·
+access-control · UFW rules · fail2ban · auditd · SSH hardening · BBR · memory
+budget · DoT listener · DNSSEC trust anchor freshness.
 
-> **Note:** After the script completes, manually replace the TLS certificate placeholder paths in `/etc/unbound/unbound.conf` with your actual Let's Encrypt certificate paths, then run `sudo systemctl reload unbound`.
-
----
-
-## 8. Phase 6 — Verification & Compliance Checklist
-
-### Functional tests
+### Manual functional tests
 
 ```bash
-# Test plain DNS resolution (from the VM itself)
+# Plain DNS resolution
 dig @127.0.0.1 www.google.com A
 
-# Test DNSSEC validation
+# DNSSEC validation (expect SERVFAIL — bad signature caught)
 dig @127.0.0.1 sigfail.verteiltesysteme.net A
-# Expect: SERVFAIL (DNSSEC failure caught)
 
-# Test from Qingdao client (DoT)
+# Version hiding (expect empty or REFUSED)
+dig @127.0.0.1 version.bind chaos txt
+
+# DoT from Qingdao client
 kdig -d @<VM_PUBLIC_IP> +tls-ca +tls-host=dns.example.com www.google.com
 
-# Test rate limiting (should receive REFUSED after threshold)
-for i in $(seq 1 1100); do dig @127.0.0.1 test${i}.example.com; done
-```
+# Unbound statistics
+sudo unbound-control stats_noreset | grep -E 'total|cache|num'
 
-### Security checks
-
-```bash
-# Verify Unbound hides version info
-dig @127.0.0.1 version.bind chaos txt
-# Expect: REFUSED or empty answer
-
-# Confirm firewall rules
-sudo ufw status verbose
-
-# Check auditd is running
-sudo systemctl status auditd
-sudo ausearch -k dns_config_changes
-
-# Verify BBR is active
+# BBR confirmation
 sysctl net.ipv4.tcp_congestion_control
-# Expect: net.ipv4.tcp_congestion_control = bbr
-
-# Check fail2ban status
-sudo fail2ban-client status sshd
 ```
 
-### CIS / PCI-DSS compliance checklist
+### CIS / PCI-DSS compliance matrix
 
-| Control | Requirement | Status |
+| Control | Requirement | Implemented by |
 |---|---|---|
-| CIS 1.1 | Filesystem partitions configured | Manual |
-| CIS 3.3.2 | TCP syncookies enabled | ✅ `sysctl` |
-| CIS 3.5 | Firewall configured (UFW) | ✅ `deploy.sh` |
-| CIS 5.2 | SSH hardened | ✅ `deploy.sh` |
-| CIS 6.2 | Packages up to date | ✅ `deploy.sh` |
-| PCI-DSS Req. 1 | Firewall rules documented & minimal | ✅ UFW |
-| PCI-DSS Req. 2 | No vendor defaults (version hidden) | ✅ Unbound |
-| PCI-DSS Req. 6 | Protect against known vulnerabilities | ✅ Rate-limit |
-| PCI-DSS Req. 8 | Unique IDs, MFA (SSH key auth) | ✅ SSH config |
-| PCI-DSS Req. 10 | Audit log all access | ✅ auditd |
+| CIS 3.3.2 | TCP syncookies enabled | `99-dns-optimize.conf` |
+| CIS 3.5 | Host firewall configured | UFW in `deploy.sh` |
+| CIS 5.2 | SSH hardened | `deploy.sh` phase 4 |
+| CIS 6.2 | Packages up-to-date | `deploy.sh` phase 1 |
+| CIS DNS 2.1 | Server version/identity hidden | `unbound.conf` |
+| PCI-DSS Req. 1 | Firewall rules documented & minimal | UFW in `deploy.sh` |
+| PCI-DSS Req. 2 | No vendor defaults | `unbound.conf` |
+| PCI-DSS Req. 4 | TLS 1.2+ in transit | DoT `tls-min-version: "TLSv1.2"` |
+| PCI-DSS Req. 6 | Protect against attacks (rate-limit) | `unbound.conf` |
+| PCI-DSS Req. 8 | Key-based auth, fail2ban | `deploy.sh` phases 4 & 7 |
+| PCI-DSS Req. 10 | Audit all access | `auditd` + `log-queries: yes` |
 
 ---
 
-## 9. Memory & Resource Reference
+## 10. Memory & Resource Reference
 
-### Unbound cache size formula
+### Cache sizing formula
 
 ```
-rrset-cache-size  = Total_DNS_cache_budget × 0.67
-msg-cache-size    = Total_DNS_cache_budget × 0.33
-
-For 1 GB RAM:
-  Total_DNS_cache_budget ≈ 192 MB
-  rrset-cache-size = 128 MB
-  msg-cache-size   =  64 MB
+Total cache budget ≈ 19% of RAM
+  rrset-cache-size = budget × 0.67  →  128 MB  (actual RR records)
+  msg-cache-size   = budget × 0.33  →   64 MB  (full DNS responses)
+  key-cache-size                    →   16 MB  (DNSSEC keys)
 ```
 
-### Monitoring commands
+Upgrade to 2 GB? Safely double all three values.
+
+### Monitoring
 
 ```bash
-# Live Unbound statistics
-sudo unbound-control stats_noreset | grep -E 'total|cache'
+# Unbound stats
+sudo unbound-control stats_noreset | grep -E 'total|cache|num'
 
-# Memory usage
-free -h
-ps aux --sort=-%mem | head -10
+# Memory overview
+free -h && ps aux --sort=-%mem | head -5
 
-# DNS query rate
-sudo unbound-control stats_noreset | grep 'num.queries'
+# Audit log search
+sudo ausearch -k dns_config_changes --start today
+sudo ausearch -k root_commands --start today | tail -20
 ```
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Likely Cause | Fix |
 |---|---|---|
-| Unbound fails to start | Config syntax error | `sudo unbound-checkconf` |
-| High memory usage | Cache sizes too large | Reduce `rrset-cache-size` to 64m |
-| DNS resolution slow | BBR not active | `sysctl net.ipv4.tcp_congestion_control` |
-| Queries refused from Qingdao | access-control ACL | Add your IP/CIDR to `access-control: X.X.X.X/24 allow` |
-| DoT not working | Missing/expired TLS cert | `certbot renew && systemctl reload unbound` |
-| SSH connection dropped | fail2ban ban | `sudo fail2ban-client set sshd unbanip <your-ip>` |
+| Unbound fails to start | Config syntax error | `sudo unbound-checkconf /etc/unbound/unbound.conf` |
+| High memory usage | Cache sizes too large | Reduce `rrset-cache-size` to 64m, `msg-cache-size` to 32m |
+| DNS queries refused | access-control ACL | `access-control: X.X.X.X/32 allow` in `unbound.conf` |
+| DNS resolution slow | BBR not active | `sysctl net.ipv4.tcp_congestion_control` → should be `bbr` |
+| DoT not working | Missing/expired TLS cert | `sudo bash scripts/setup-tls.sh <domain> <email>` |
+| SSH connection locked out | fail2ban ban | `sudo fail2ban-client set sshd unbanip <your-ip>` |
+| `sysctl: nf_conntrack` errors | Module not loaded | Ensure UFW is enabled: `ufw status` |
+| `unbound-control` fails | Socket not found | `sudo systemctl restart unbound` |
+| DNSSEC SERVFAIL on valid domain | Clock skew | `sudo timedatectl set-ntp true` |
+| Syslog filling disk | `log-queries: yes` on busy server | Set `log-queries: no` if disk space is limited |
 
 ---
 
-## File Structure
+## 12. File Structure
 
 ```
 dns/
-├── README.md                    # This guide
+├── README.md                        # This guide
 ├── config/
-│   ├── unbound.conf             # Unbound optimized configuration
-│   └── 99-dns-optimize.conf     # Sysctl network optimization
+│   ├── unbound.conf                 # Unbound: 1 GB RAM, 2 vCPU, CIS/PCI-DSS hardened
+│   └── 99-dns-optimize.conf         # Sysctl: BBR, UDP buffers, nf_conntrack, OOM tuning
 └── scripts/
-    └── deploy.sh                # Automated deployment script
+    ├── deploy.sh                    # Full automated deployment (run first)
+    ├── setup-tls.sh                 # Enable DNS over TLS after cert is provisioned
+    └── health-check.sh             # Post-deployment verification & compliance check
 ```
 
 ---

@@ -3,15 +3,16 @@
 # deploy.sh — Public DNS Server (Unbound + DoT/DoH) Deployment Script
 #
 # Target:     Azure B2ast (2 vCPU / 1 GB RAM), Ubuntu 22.04/24.04 LTS
-# Location:   Japan East (optimized for Qingdao, China clients)
+# Location:   Japan East (optimised for Qingdao, China clients)
 # Compliance: CIS Benchmarks (Ubuntu) · PCI-DSS v4.0
 #
 # Usage:
 #   sudo bash scripts/deploy.sh
 #
-# After completion, replace the TLS certificate placeholder paths in
-# /etc/unbound/unbound.conf with your actual Let's Encrypt certificate paths,
-# then run: sudo systemctl reload unbound
+# After completion:
+#   - Add your client IP to /etc/unbound/unbound.conf (access-control section)
+#   - Run scripts/setup-tls.sh <domain> <email> to enable DNS over TLS
+#   - Run scripts/health-check.sh to verify the deployment
 # =============================================================================
 
 set -euo pipefail
@@ -34,7 +35,7 @@ require_root() {
     [[ "$(id -u)" -eq 0 ]] || die "This script must be run as root (sudo bash $0)"
 }
 
-# Create a timestamped backup of a file
+# Create a timestamped backup of an existing file
 backup_file() {
     local file="$1"
     [[ -f "${file}" ]] && cp "${file}" "${file}.bak.$(date +%Y%m%d%H%M%S)"
@@ -59,6 +60,8 @@ phase1_packages() {
         fail2ban \
         auditd \
         apparmor-profiles \
+        certbot \
+        dnsutils \
         curl \
         jq
 
@@ -66,62 +69,14 @@ phase1_packages() {
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 2 — Kernel / network optimization (BBR, buffer tuning)
+# Phase 2 — UFW firewall rules (CIS 3.5 / PCI-DSS Req. 1)
+# Must run BEFORE phase3_sysctl so that UFW loads the nf_conntrack module;
+# the sysctl config contains net.netfilter.nf_conntrack_* keys that require
+# that module to be present in the kernel.
 # --------------------------------------------------------------------------- #
 
-phase2_sysctl() {
-    log "Phase 2: Applying sysctl network optimizations..."
-
-    local src="${REPO_ROOT}/config/99-dns-optimize.conf"
-    local dst="/etc/sysctl.d/99-dns-optimize.conf"
-
-    if [[ -f "${src}" ]]; then
-        cp "${src}" "${dst}"
-        log "Copied ${src} -> ${dst}"
-    else
-        warn "config/99-dns-optimize.conf not found; writing defaults inline."
-        cat > "${dst}" <<'SYSCTL'
-# BBR congestion control — reduces latency on lossy cross-border links
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# UDP receive/send buffers — prevents DNS query drops under burst load
-net.core.rmem_max = 4194304
-net.core.wmem_max = 4194304
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-
-# SYN flood protection (CIS 3.3.2)
-net.ipv4.tcp_syncookies = 1
-
-# Disable packet forwarding — VM is a DNS resolver, not a router (PCI-DSS Req.1)
-net.ipv4.ip_forward = 0
-net.ipv6.conf.all.forwarding = 0
-
-# Disable IPv6 if unused (reduces attack surface)
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-
-# Ignore ICMP redirects (CIS 3.3.1)
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-
-# Log martian packets
-net.ipv4.conf.all.log_martians = 1
-SYSCTL
-    fi
-
-    sysctl -p "${dst}" || warn "Some sysctl settings may require a reboot."
-    log "Phase 2 complete."
-}
-
-# --------------------------------------------------------------------------- #
-# Phase 3 — UFW firewall rules (CIS 3.5 / PCI-DSS Req. 1)
-# --------------------------------------------------------------------------- #
-
-phase3_ufw() {
-    log "Phase 3: Configuring UFW firewall..."
+phase2_ufw() {
+    log "Phase 2: Configuring UFW firewall..."
 
     ufw --force reset
 
@@ -132,11 +87,55 @@ phase3_ufw() {
     ufw allow 53/tcp    comment 'DNS TCP'
     ufw allow 53/udp    comment 'DNS UDP'
     ufw allow 853/tcp   comment 'DNS over TLS (DoT)'
-    ufw allow 443/tcp   comment 'DNS over HTTPS (DoH)'
+    ufw allow 443/tcp   comment 'DNS over HTTPS / Nginx (DoH)'
 
+    # Enable UFW — this loads the nf_conntrack netfilter module into the kernel
     ufw --force enable
 
     ufw status verbose
+    log "Phase 2 complete."
+}
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — Kernel / network optimisation (BBR, buffer tuning)
+# Runs AFTER UFW (phase2) to ensure nf_conntrack module is already loaded.
+# --------------------------------------------------------------------------- #
+
+phase3_sysctl() {
+    log "Phase 3: Applying sysctl network optimisations..."
+
+    local src="${REPO_ROOT}/config/99-dns-optimize.conf"
+    local dst="/etc/sysctl.d/99-dns-optimize.conf"
+
+    if [[ -f "${src}" ]]; then
+        cp "${src}" "${dst}"
+        log "Copied ${src} -> ${dst}"
+    else
+        warn "config/99-dns-optimize.conf not found; writing minimum inline settings."
+        cat > "${dst}" <<'SYSCTL'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 4194304
+net.core.wmem_max = 4194304
+net.ipv4.tcp_syncookies = 1
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv6.conf.all.disable_ipv6 = 1
+net.netfilter.nf_conntrack_max = 131072
+vm.swappiness = 10
+vm.overcommit_memory = 0
+SYSCTL
+    fi
+
+    # Apply all sysctl drop-in files. Suppress nf_conntrack key errors that
+    # occur when the module hasn't fully initialised yet; all other errors are
+    # shown to aid troubleshooting.
+    sysctl --system 2>&1 | grep -vE '^net\.netfilter\.nf_conntrack' || true
+    # Reload the conntrack keys explicitly now that the module is definitely loaded
+    sysctl -q -p "${dst}" || warn "Some sysctl settings may require a reboot."
+
     log "Phase 3 complete."
 }
 
@@ -149,13 +148,13 @@ phase4_ssh() {
 
     local sshd_config="/etc/ssh/sshd_config"
 
-    # Back up original
+    # Back up original before any modification
     backup_file "${sshd_config}"
 
-    # Apply hardened settings via sshd_config.d drop-in (Ubuntu 22.04+)
+    # Write a drop-in file (Ubuntu 22.04+ reads /etc/ssh/sshd_config.d/*.conf)
     local drop_in="/etc/ssh/sshd_config.d/99-hardened.conf"
     cat > "${drop_in}" <<'SSHD'
-# CIS Ubuntu 22.04 SSH hardening (PCI-DSS Req. 8)
+# CIS Ubuntu 22.04 SSH hardening — PCI-DSS Req. 8
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
@@ -168,13 +167,13 @@ AllowTcpForwarding no
 PrintMotd no
 SSHD
 
-    # Validate the full sshd configuration (including drop-ins on Ubuntu 22.04+)
-    # before restarting to prevent lockouts
+    # Validate the complete sshd configuration (main file + all drop-ins)
+    # before restarting to prevent accidental lockout
     if sshd -t; then
         systemctl restart sshd
         log "SSH hardened and restarted."
     else
-        warn "sshd config test failed — reverting drop-in."
+        warn "sshd config test failed — reverting drop-in to avoid lockout."
         rm -f "${drop_in}"
     fi
 
@@ -189,7 +188,7 @@ phase5_auditd() {
     log "Phase 5: Configuring auditd rules..."
 
     cat > /etc/audit/rules.d/dns-server.rules <<'AUDIT'
-# PCI-DSS Req. 10 — Audit log all privileged access and configuration changes
+# PCI-DSS Req. 10 — audit all privileged access and configuration changes
 
 # Monitor Unbound configuration
 -w /etc/unbound/ -p wa -k dns_config_changes
@@ -215,13 +214,17 @@ phase5_auditd() {
 -a always,exit -F arch=b64 -S execve -F uid=0 -k root_commands
 AUDIT
 
-    systemctl enable --now auditd
-    augenrules --load || warn "augenrules --load failed; rules will apply on next reboot."
+    systemctl enable auditd
+    # Restart (not just start) so that the new rule file is picked up cleanly
+    systemctl restart auditd
+    # Load rules into the running kernel
+    augenrules --load || warn "augenrules --load failed; rules apply on next reboot."
+
     log "Phase 5 complete."
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 6 — Unbound configuration
+# Phase 6 — Unbound DNS configuration
 # --------------------------------------------------------------------------- #
 
 phase6_unbound() {
@@ -231,7 +234,6 @@ phase6_unbound() {
     local dst="/etc/unbound/unbound.conf"
 
     if [[ -f "${src}" ]]; then
-        # Back up existing config
         backup_file "${dst}"
         cp "${src}" "${dst}"
         log "Copied ${src} -> ${dst}"
@@ -242,18 +244,29 @@ phase6_unbound() {
     # Ensure the unbound user owns its data directory
     chown -R unbound:unbound /var/lib/unbound/ 2>/dev/null || true
 
-    # Download latest root hints
-    log "Downloading root hints..."
-    curl -sSo /var/lib/unbound/root.hints \
-        https://www.internic.net/domain/named.cache \
-        || warn "Failed to download root hints; cached copy will be used."
+    # Initialise / refresh the DNSSEC root trust anchor
+    log "Initialising DNSSEC root trust anchor..."
+    if [[ -f /etc/unbound/icannbundle.pem ]]; then
+        unbound-anchor -a /var/lib/unbound/root.key \
+                       -c /etc/unbound/icannbundle.pem || true
+    else
+        unbound-anchor -a /var/lib/unbound/root.key || true
+    fi
 
-    # Validate configuration
+    # Download the latest root hints
+    log "Downloading root hints..."
+    curl -sSf -o /var/lib/unbound/root.hints \
+        https://www.internic.net/domain/named.cache \
+        || warn "Root hints download failed; cached copy will be used."
+
+    chown unbound:unbound /var/lib/unbound/root.hints 2>/dev/null || true
+
+    # Validate configuration before starting
     if unbound-checkconf "${dst}"; then
         systemctl enable --now unbound
         log "Unbound started successfully."
     else
-        die "Unbound configuration check failed. Please review ${dst}"
+        die "Unbound configuration check failed. Review ${dst} and re-run."
     fi
 
     log "Phase 6 complete."
@@ -295,29 +308,30 @@ ${GREEN}=============================================================
   Deployment complete!
 =============================================================${NC}
 
-Next steps:
-  1. Obtain a TLS certificate for DoT:
-       sudo certbot certonly --standalone -d <your-domain>
-
-  2. Update TLS paths in /etc/unbound/unbound.conf:
-       tls-service-key: "/etc/letsencrypt/live/<domain>/privkey.pem"
-       tls-service-pem: "/etc/letsencrypt/live/<domain>/fullchain.pem"
-
-  3. Reload Unbound:
+Required next steps:
+  1. Add your client IP to /etc/unbound/unbound.conf:
+       access-control: <YOUR_IP>/32 allow
+     Then reload Unbound:
        sudo systemctl reload unbound
 
-  4. Restrict DNS access to your Qingdao IP in /etc/unbound/unbound.conf:
-       access-control: <your-ip>/32 allow
+  2. Enable DNS over TLS (DoT) once you have a domain:
+       sudo bash scripts/setup-tls.sh dns.example.com admin@example.com
 
-  5. Verify DNS resolution:
-       dig @127.0.0.1 www.google.com A
+  3. Run the health check to verify everything works:
+       sudo bash scripts/health-check.sh
 
-  6. Verify DNSSEC validation:
-       dig @127.0.0.1 sigfail.verteiltesysteme.net A
-       (Expect: SERVFAIL)
+Verification commands:
+  # Test plain DNS resolution
+  dig @127.0.0.1 www.google.com A
 
-  7. Check Unbound statistics:
-       sudo unbound-control stats_noreset
+  # Test DNSSEC (expect SERVFAIL — validation working)
+  dig @127.0.0.1 sigfail.verteiltesysteme.net A
+
+  # Check Unbound statistics
+  sudo unbound-control stats_noreset
+
+  # Confirm firewall rules
+  sudo ufw status verbose
 
 SUMMARY
 }
@@ -333,8 +347,8 @@ main() {
     log "Repository root: ${REPO_ROOT}"
 
     phase1_packages
-    phase2_sysctl
-    phase3_ufw
+    phase2_ufw        # UFW before sysctl — loads nf_conntrack module
+    phase3_sysctl     # sysctl after UFW — nf_conntrack keys now safe to apply
     phase4_ssh
     phase5_auditd
     phase6_unbound
