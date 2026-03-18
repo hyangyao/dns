@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy.sh — Public DNS Server (Unbound + DoT/DoH) Deployment Script
+# deploy.sh — 公共DNS服务器（Unbound + DoT/DoH）部署脚本
 #
-# Target:     Azure B2ast (2 vCPU / 1 GB RAM), Ubuntu 22.04/24.04 LTS
-# Location:   Japan East (optimised for Qingdao, China clients)
-# Compliance: CIS Benchmarks (Ubuntu) · PCI-DSS v4.0
+# 目标机器：Azure B2ast（2 vCPU / 1 GB RAM），Ubuntu 22.04/24.04 LTS
+# 部署位置：日本东部（针对中国青岛客户端优化）
+# 合规标准：CIS 基准（Ubuntu）· PCI-DSS v4.0
 #
-# Usage:
+# 使用方法：
 #   sudo bash scripts/deploy.sh
 #
-# After completion:
-#   - Add your client IP to /etc/unbound/unbound.conf (access-control section)
-#   - Run scripts/setup-tls.sh <domain> <email> to enable DNS over TLS
-#   - Run scripts/health-check.sh to verify the deployment
+# 完成后需要执行：
+#   - 将您的客户端 IP 添加至 /etc/unbound/unbound.conf 的访问控制部分
+#   - 运行 scripts/setup-tls.sh <域名> <邮箱> 以启用 DNS over TLS
+#   - 运行 scripts/health-check.sh 验证部署结果
 # =============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# 辅助函数
 # --------------------------------------------------------------------------- #
 
 RED='\033[0;31m'
@@ -27,30 +27,30 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+log()  { echo -e "${GREEN}[信息]${NC}  $*"; }
+warn() { echo -e "${YELLOW}[警告]${NC}  $*"; }
+die()  { echo -e "${RED}[错误]${NC} $*" >&2; exit 1; }
 
 require_root() {
-    [[ "$(id -u)" -eq 0 ]] || die "This script must be run as root (sudo bash $0)"
+    [[ "$(id -u)" -eq 0 ]] || die "此脚本必须以 root 身份运行（sudo bash $0）"
 }
 
-# Create a timestamped backup of an existing file
+# 对已存在的文件创建带时间戳的备份
 backup_file() {
     local file="$1"
     [[ -f "${file}" ]] && cp "${file}" "${file}.bak.$(date +%Y%m%d%H%M%S)"
 }
 
-# Detect the script's repository root (one level above scripts/)
+# 检测脚本所在仓库根目录（scripts/ 的上一级）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # --------------------------------------------------------------------------- #
-# Phase 1 — System update & package installation
+# 阶段一 — 系统更新与软件包安装
 # --------------------------------------------------------------------------- #
 
 phase1_packages() {
-    log "Phase 1: Updating system and installing packages..."
+    log "阶段一：更新系统并安装软件包..."
 
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
@@ -65,18 +65,17 @@ phase1_packages() {
         curl \
         jq
 
-    log "Phase 1 complete."
+    log "阶段一完成。"
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 2 — UFW firewall rules (CIS 3.5 / PCI-DSS Req. 1)
-# Must run BEFORE phase3_sysctl so that UFW loads the nf_conntrack module;
-# the sysctl config contains net.netfilter.nf_conntrack_* keys that require
-# that module to be present in the kernel.
+# 阶段二 — UFW 防火墙规则（CIS 3.5 / PCI-DSS 要求1）
+# 必须在 phase3_sysctl 之前运行，以便 UFW 加载 nf_conntrack 模块；
+# sysctl 配置中的 net.netfilter.nf_conntrack_* 参数要求该模块已存在于内核中。
 # --------------------------------------------------------------------------- #
 
 phase2_ufw() {
-    log "Phase 2: Configuring UFW firewall..."
+    log "阶段二：配置 UFW 防火墙..."
 
     ufw --force reset
 
@@ -86,32 +85,32 @@ phase2_ufw() {
     ufw allow 22/tcp    comment 'SSH'
     ufw allow 53/tcp    comment 'DNS TCP'
     ufw allow 53/udp    comment 'DNS UDP'
-    ufw allow 853/tcp   comment 'DNS over TLS (DoT)'
-    ufw allow 443/tcp   comment 'DNS over HTTPS / Nginx (DoH)'
+    ufw allow 853/tcp   comment 'DNS over TLS（DoT）'
+    ufw allow 443/tcp   comment 'DNS over HTTPS / Nginx（DoH）'
 
-    # Enable UFW — this loads the nf_conntrack netfilter module into the kernel
+    # 启用 UFW — 此操作会将 nf_conntrack 网络过滤模块加载到内核
     ufw --force enable
 
     ufw status verbose
-    log "Phase 2 complete."
+    log "阶段二完成。"
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 3 — Kernel / network optimisation (BBR, buffer tuning)
-# Runs AFTER UFW (phase2) to ensure nf_conntrack module is already loaded.
+# 阶段三 — 内核/网络优化（BBR、缓冲区调优）
+# 在 UFW（阶段二）之后运行，以确保 nf_conntrack 模块已加载。
 # --------------------------------------------------------------------------- #
 
 phase3_sysctl() {
-    log "Phase 3: Applying sysctl network optimisations..."
+    log "阶段三：应用 sysctl 网络优化配置..."
 
     local src="${REPO_ROOT}/config/99-dns-optimize.conf"
     local dst="/etc/sysctl.d/99-dns-optimize.conf"
 
     if [[ -f "${src}" ]]; then
         cp "${src}" "${dst}"
-        log "Copied ${src} -> ${dst}"
+        log "已复制 ${src} -> ${dst}"
     else
-        warn "config/99-dns-optimize.conf not found; writing minimum inline settings."
+        warn "未找到 config/99-dns-optimize.conf；正在写入最小内联配置。"
         cat > "${dst}" <<'SYSCTL'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -129,32 +128,31 @@ vm.overcommit_memory = 0
 SYSCTL
     fi
 
-    # Apply all sysctl drop-in files. Suppress nf_conntrack key errors that
-    # occur when the module hasn't fully initialised yet; all other errors are
-    # shown to aid troubleshooting.
+    # 应用所有 sysctl drop-in 文件。屏蔽模块尚未完全初始化时产生的
+    # nf_conntrack 参数错误；其余错误正常显示以辅助排查问题。
     sysctl --system 2>&1 | grep -vE '^net\.netfilter\.nf_conntrack' || true
-    # Reload the conntrack keys explicitly now that the module is definitely loaded
-    sysctl -q -p "${dst}" || warn "Some sysctl settings may require a reboot."
+    # 模块确认已加载后，显式重新加载 conntrack 相关参数
+    sysctl -q -p "${dst}" || warn "部分 sysctl 设置可能需要重启后生效。"
 
-    log "Phase 3 complete."
+    log "阶段三完成。"
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 4 — SSH hardening (CIS Section 5.2 / PCI-DSS Req. 8)
+# 阶段四 — SSH 加固（CIS 第5.2节 / PCI-DSS 要求8）
 # --------------------------------------------------------------------------- #
 
 phase4_ssh() {
-    log "Phase 4: Hardening SSH configuration..."
+    log "阶段四：加固 SSH 配置..."
 
     local sshd_config="/etc/ssh/sshd_config"
 
-    # Back up original before any modification
+    # 修改前先备份原始文件
     backup_file "${sshd_config}"
 
-    # Write a drop-in file (Ubuntu 22.04+ reads /etc/ssh/sshd_config.d/*.conf)
+    # 写入 drop-in 文件（Ubuntu 22.04+ 会读取 /etc/ssh/sshd_config.d/*.conf）
     local drop_in="/etc/ssh/sshd_config.d/99-hardened.conf"
     cat > "${drop_in}" <<'SSHD'
-# CIS Ubuntu 22.04 SSH hardening — PCI-DSS Req. 8
+# CIS Ubuntu 22.04 SSH 加固 — PCI-DSS 要求8
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
@@ -167,68 +165,68 @@ AllowTcpForwarding no
 PrintMotd no
 SSHD
 
-    # Validate the complete sshd configuration (main file + all drop-ins)
-    # before restarting to prevent accidental lockout
+    # 在重启前验证完整的 sshd 配置（主文件 + 所有 drop-in 文件），
+    # 防止意外封锁自身 SSH 连接
     if sshd -t; then
         systemctl restart sshd
-        log "SSH hardened and restarted."
+        log "SSH 已加固并重启。"
     else
-        warn "sshd config test failed — reverting drop-in to avoid lockout."
+        warn "sshd 配置测试失败 — 已回滚 drop-in 文件以避免封锁。"
         rm -f "${drop_in}"
     fi
 
-    log "Phase 4 complete."
+    log "阶段四完成。"
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 5 — auditd rules (PCI-DSS Req. 10)
+# 阶段五 — auditd 规则（PCI-DSS 要求10）
 # --------------------------------------------------------------------------- #
 
 phase5_auditd() {
-    log "Phase 5: Configuring auditd rules..."
+    log "阶段五：配置 auditd 规则..."
 
     cat > /etc/audit/rules.d/dns-server.rules <<'AUDIT'
-# PCI-DSS Req. 10 — audit all privileged access and configuration changes
+# PCI-DSS 要求10 — 审计所有特权访问和配置变更
 
-# Monitor Unbound configuration
+# 监控 Unbound 配置
 -w /etc/unbound/ -p wa -k dns_config_changes
 
-# Monitor identity files
+# 监控身份文件
 -w /etc/passwd  -p wa -k identity_changes
 -w /etc/shadow  -p wa -k identity_changes
 -w /etc/group   -p wa -k identity_changes
 
-# Monitor SSH configuration
+# 监控 SSH 配置
 -w /etc/ssh/sshd_config   -p wa -k sshd_config_changes
 -w /etc/ssh/sshd_config.d -p wa -k sshd_config_changes
 
-# Monitor sudoers
+# 监控 sudoers
 -w /etc/sudoers    -p wa -k sudoers_changes
 -w /etc/sudoers.d/ -p wa -k sudoers_changes
 
-# Monitor sysctl configuration
+# 监控 sysctl 配置
 -w /etc/sysctl.conf  -p wa -k sysctl_changes
 -w /etc/sysctl.d/    -p wa -k sysctl_changes
 
-# Log all root command executions
+# 记录所有 root 命令执行
 -a always,exit -F arch=b64 -S execve -F uid=0 -k root_commands
 AUDIT
 
     systemctl enable auditd
-    # Restart (not just start) so that the new rule file is picked up cleanly
+    # 使用 restart（而非 start）以确保新规则文件被完整加载
     systemctl restart auditd
-    # Load rules into the running kernel
-    augenrules --load || warn "augenrules --load failed; rules apply on next reboot."
+    # 将规则加载到运行中的内核
+    augenrules --load || warn "augenrules --load 失败；规则将在下次重启后生效。"
 
-    log "Phase 5 complete."
+    log "阶段五完成。"
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 6 — Unbound DNS configuration
+# 阶段六 — Unbound DNS 配置
 # --------------------------------------------------------------------------- #
 
 phase6_unbound() {
-    log "Phase 6: Installing Unbound configuration..."
+    log "阶段六：安装 Unbound 配置..."
 
     local src="${REPO_ROOT}/config/unbound.conf"
     local dst="/etc/unbound/unbound.conf"
@@ -236,16 +234,16 @@ phase6_unbound() {
     if [[ -f "${src}" ]]; then
         backup_file "${dst}"
         cp "${src}" "${dst}"
-        log "Copied ${src} -> ${dst}"
+        log "已复制 ${src} -> ${dst}"
     else
-        warn "config/unbound.conf not found in repo; using OS default."
+        warn "仓库中未找到 config/unbound.conf；使用操作系统默认配置。"
     fi
 
-    # Ensure the unbound user owns its data directory
+    # 确保 unbound 用户拥有其数据目录
     chown -R unbound:unbound /var/lib/unbound/ 2>/dev/null || true
 
-    # Initialise / refresh the DNSSEC root trust anchor
-    log "Initialising DNSSEC root trust anchor..."
+    # 初始化/刷新 DNSSEC 根信任锚
+    log "正在初始化 DNSSEC 根信任锚..."
     if [[ -f /etc/unbound/icannbundle.pem ]]; then
         unbound-anchor -a /var/lib/unbound/root.key \
                        -c /etc/unbound/icannbundle.pem || true
@@ -253,31 +251,31 @@ phase6_unbound() {
         unbound-anchor -a /var/lib/unbound/root.key || true
     fi
 
-    # Download the latest root hints
-    log "Downloading root hints..."
+    # 下载最新根提示文件
+    log "正在下载根提示文件..."
     curl -sSf -o /var/lib/unbound/root.hints \
         https://www.internic.net/domain/named.cache \
-        || warn "Root hints download failed; cached copy will be used."
+        || warn "根提示文件下载失败；将使用已缓存的副本。"
 
     chown unbound:unbound /var/lib/unbound/root.hints 2>/dev/null || true
 
-    # Validate configuration before starting
+    # 启动前验证配置
     if unbound-checkconf "${dst}"; then
         systemctl enable --now unbound
-        log "Unbound started successfully."
+        log "Unbound 启动成功。"
     else
-        die "Unbound configuration check failed. Review ${dst} and re-run."
+        die "Unbound 配置检查失败。请检查 ${dst} 后重新运行。"
     fi
 
-    log "Phase 6 complete."
+    log "阶段六完成。"
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 7 — fail2ban
+# 阶段七 — fail2ban
 # --------------------------------------------------------------------------- #
 
 phase7_fail2ban() {
-    log "Phase 7: Configuring fail2ban..."
+    log "阶段七：配置 fail2ban..."
 
     cat > /etc/fail2ban/jail.local <<'F2B'
 [DEFAULT]
@@ -294,61 +292,61 @@ backend  = %(syslog_backend)s
 F2B
 
     systemctl enable --now fail2ban
-    log "Phase 7 complete."
+    log "阶段七完成。"
 }
 
 # --------------------------------------------------------------------------- #
-# Summary
+# 部署摘要
 # --------------------------------------------------------------------------- #
 
 print_summary() {
     cat <<SUMMARY
 
 ${GREEN}=============================================================
-  Deployment complete!
+  部署完成！
 =============================================================${NC}
 
-Required next steps:
-  1. Add your client IP to /etc/unbound/unbound.conf:
-       access-control: <YOUR_IP>/32 allow
-     Then reload Unbound:
+后续必要操作：
+  1. 将您的客户端 IP 添加至 /etc/unbound/unbound.conf：
+       access-control: <您的IP>/32 allow
+     然后重载 Unbound：
        sudo systemctl reload unbound
 
-  2. Enable DNS over TLS (DoT) once you have a domain:
+  2. 拥有域名后启用 DNS over TLS（DoT）：
        sudo bash scripts/setup-tls.sh dns.example.com admin@example.com
 
-  3. Run the health check to verify everything works:
+  3. 运行健康检查以验证所有功能正常：
        sudo bash scripts/health-check.sh
 
-Verification commands:
-  # Test plain DNS resolution
+验证命令：
+  # 测试普通 DNS 解析
   dig @127.0.0.1 www.google.com A
 
-  # Test DNSSEC (expect SERVFAIL — validation working)
+  # 测试 DNSSEC（应返回 SERVFAIL — 验证功能正常）
   dig @127.0.0.1 sigfail.verteiltesysteme.net A
 
-  # Check Unbound statistics
+  # 查看 Unbound 统计信息
   sudo unbound-control stats_noreset
 
-  # Confirm firewall rules
+  # 确认防火墙规则
   sudo ufw status verbose
 
 SUMMARY
 }
 
 # --------------------------------------------------------------------------- #
-# Main
+# 主函数
 # --------------------------------------------------------------------------- #
 
 main() {
     require_root
 
-    log "Starting DNS server deployment on $(hostname) at $(date -u)"
-    log "Repository root: ${REPO_ROOT}"
+    log "在 $(hostname) 上于 $(date -u) 开始 DNS 服务器部署"
+    log "仓库根目录：${REPO_ROOT}"
 
     phase1_packages
-    phase2_ufw        # UFW before sysctl — loads nf_conntrack module
-    phase3_sysctl     # sysctl after UFW — nf_conntrack keys now safe to apply
+    phase2_ufw        # UFW 在 sysctl 之前 — 加载 nf_conntrack 模块
+    phase3_sysctl     # sysctl 在 UFW 之后 — nf_conntrack 参数现在可安全应用
     phase4_ssh
     phase5_auditd
     phase6_unbound

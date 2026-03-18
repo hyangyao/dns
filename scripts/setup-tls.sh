@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup-tls.sh — Provision a Let's Encrypt certificate and enable Unbound DoT
+# setup-tls.sh — 申请 Let's Encrypt 证书并启用 Unbound DoT
 #
-# This script:
-#   1. Temporarily opens port 80 in UFW for the ACME HTTP-01 challenge
-#   2. Obtains a TLS certificate via certbot --standalone
-#   3. Closes port 80 in UFW
-#   4. Patches /etc/unbound/unbound.conf to activate DoT on port 853
-#   5. Validates and reloads Unbound
-#   6. Installs a cron job for automatic certificate renewal
+# 此脚本执行以下步骤：
+#   1. 在 UFW 中临时开放 80 端口以完成 ACME HTTP-01 验证
+#   2. 通过 certbot --standalone 获取 TLS 证书
+#   3. 在 UFW 中关闭 80 端口
+#   4. 修改 /etc/unbound/unbound.conf 以激活 853 端口上的 DoT
+#   5. 验证并重载 Unbound
+#   6. 安装证书自动续期的 cron 任务
 #
-# Usage:
-#   sudo bash scripts/setup-tls.sh <domain> <email>
+# 使用方法：
+#   sudo bash scripts/setup-tls.sh <域名> <邮箱>
 #
-# Example:
+# 示例：
 #   sudo bash scripts/setup-tls.sh dns.example.com admin@example.com
 #
-# Prerequisites:
-#   - deploy.sh has already been run
-#   - The domain's A record points to this server's public IP
-#   - Port 80 must be reachable from the internet (Azure NSG must allow it)
+# 前提条件：
+#   - deploy.sh 已运行完成
+#   - 域名的 A 记录指向本服务器的公网 IP
+#   - 80 端口必须可从互联网访问（Azure NSG 需放行）
 # =============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# 辅助函数
 # --------------------------------------------------------------------------- #
 
 RED='\033[0;31m'
@@ -34,22 +34,22 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+log()  { echo -e "${GREEN}[信息]${NC}  $*"; }
+warn() { echo -e "${YELLOW}[警告]${NC}  $*"; }
+die()  { echo -e "${RED}[错误]${NC} $*" >&2; exit 1; }
 
 require_root() {
-    [[ "$(id -u)" -eq 0 ]] || die "This script must be run as root (sudo bash $0)"
+    [[ "$(id -u)" -eq 0 ]] || die "此脚本必须以 root 身份运行（sudo bash $0）"
 }
 
 # --------------------------------------------------------------------------- #
-# Argument validation
+# 参数验证
 # --------------------------------------------------------------------------- #
 
 usage() {
-    echo "Usage: sudo bash scripts/setup-tls.sh <domain> <email>"
-    echo "  domain  — fully-qualified domain name pointing to this server"
-    echo "  email   — contact address for Let's Encrypt expiry notices"
+    echo "用法：sudo bash scripts/setup-tls.sh <域名> <邮箱>"
+    echo "  域名  — 指向本服务器的完全限定域名"
+    echo "  邮箱  — Let's Encrypt 到期通知的联系邮箱"
     exit 1
 }
 
@@ -57,61 +57,61 @@ usage() {
 DOMAIN="$1"
 EMAIL="$2"
 
-# Basic validation
+# 基本格式验证
 [[ "${DOMAIN}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$ ]] \
-    || die "Invalid domain name: ${DOMAIN}"
+    || die "无效的域名：${DOMAIN}"
 [[ "${EMAIL}" =~ ^[^@]+@[^@]+\.[^@]+$ ]] \
-    || die "Invalid email address: ${EMAIL}"
+    || die "无效的邮箱地址：${EMAIL}"
 
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 
 # --------------------------------------------------------------------------- #
-# Pre-flight checks
+# 预检查
 # --------------------------------------------------------------------------- #
 
 preflight() {
-    log "Pre-flight checks..."
+    log "执行预检查..."
 
-    command -v certbot   &>/dev/null || die "certbot not found. Run deploy.sh first."
-    command -v ufw       &>/dev/null || die "ufw not found. Run deploy.sh first."
-    command -v unbound   &>/dev/null || die "unbound not found. Run deploy.sh first."
-    [[ -f "${UNBOUND_CONF}" ]]       || die "Unbound config not found: ${UNBOUND_CONF}"
+    command -v certbot   &>/dev/null || die "未找到 certbot。请先运行 deploy.sh。"
+    command -v ufw       &>/dev/null || die "未找到 ufw。请先运行 deploy.sh。"
+    command -v unbound   &>/dev/null || die "未找到 unbound。请先运行 deploy.sh。"
+    [[ -f "${UNBOUND_CONF}" ]]       || die "未找到 Unbound 配置文件：${UNBOUND_CONF}"
 
-    # Confirm the domain resolves to this host's public IP
+    # 确认域名解析到本机公网 IP
     local server_ip
     server_ip="$(curl -sf --max-time 5 https://api.ipify.org || echo 'unknown')"
     local domain_ip
     domain_ip="$(dig +short "${DOMAIN}" A | tail -1 || echo 'unknown')"
 
     if [[ "${server_ip}" == "unknown" || "${domain_ip}" == "unknown" ]]; then
-        warn "Could not verify DNS: server IP=${server_ip}, ${DOMAIN}=${domain_ip}"
-        warn "Proceeding anyway — certbot will report if the domain is unreachable."
+        warn "无法验证 DNS：服务器IP=${server_ip}，${DOMAIN}=${domain_ip}"
+        warn "继续执行 — 如域名不可达，certbot 会报告错误。"
     elif [[ "${server_ip}" != "${domain_ip}" ]]; then
-        warn "${DOMAIN} resolves to ${domain_ip}, but this server's IP is ${server_ip}."
-        warn "The ACME challenge will fail if the domain does not point here."
-        read -rp "Continue anyway? [y/N] " confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] || die "Aborted."
+        warn "${DOMAIN} 解析到 ${domain_ip}，但本服务器 IP 为 ${server_ip}。"
+        warn "若域名未指向本服务器，ACME 验证将会失败。"
+        read -rp "是否仍要继续？[y/N] " confirm
+        [[ "${confirm}" =~ ^[Yy]$ ]] || die "已中止。"
     else
-        log "Domain ${DOMAIN} correctly resolves to ${server_ip}."
+        log "域名 ${DOMAIN} 正确解析到 ${server_ip}。"
     fi
 
-    log "Pre-flight checks passed."
+    log "预检查通过。"
 }
 
 # --------------------------------------------------------------------------- #
-# Step 1 — Obtain TLS certificate
+# 步骤一 — 获取 TLS 证书
 # --------------------------------------------------------------------------- #
 
 obtain_certificate() {
-    log "Obtaining TLS certificate for ${DOMAIN}..."
+    log "正在为 ${DOMAIN} 获取 TLS 证书..."
 
-    # Open port 80 temporarily for the ACME HTTP-01 challenge
-    log "Opening port 80 temporarily for ACME challenge..."
-    ufw allow 80/tcp comment 'ACME HTTP-01 challenge (temporary)'
+    # 临时开放 80 端口以完成 ACME HTTP-01 验证
+    log "临时开放 80 端口以完成 ACME 验证..."
+    ufw allow 80/tcp comment 'ACME HTTP-01 验证（临时）'
 
-    # Run certbot; port 80 is closed in a trap even if certbot fails
-    trap 'log "Closing port 80..."; ufw delete allow 80/tcp 2>/dev/null || true' EXIT
+    # 运行 certbot；即使 certbot 失败，trap 也会关闭 80 端口
+    trap 'log "正在关闭 80 端口..."; ufw delete allow 80/tcp 2>/dev/null || true' EXIT
 
     certbot certonly \
         --standalone \
@@ -121,35 +121,34 @@ obtain_certificate() {
         --email "${EMAIL}" \
         -d "${DOMAIN}"
 
-    # Close port 80 now (trap also fires, but being explicit is cleaner)
-    log "Closing port 80..."
+    # 立即关闭 80 端口（trap 也会触发，但显式处理更清晰）
+    log "正在关闭 80 端口..."
     ufw delete allow 80/tcp 2>/dev/null || true
     trap - EXIT
 
     [[ -f "${CERT_DIR}/fullchain.pem" ]] \
-        || die "Certificate not found after certbot run: ${CERT_DIR}/fullchain.pem"
+        || die "certbot 运行后未找到证书：${CERT_DIR}/fullchain.pem"
 
-    log "Certificate obtained: ${CERT_DIR}"
+    log "证书已获取：${CERT_DIR}"
 }
 
 # --------------------------------------------------------------------------- #
-# Step 2 — Enable DoT in Unbound configuration
+# 步骤二 — 在 Unbound 配置中启用 DoT
 # --------------------------------------------------------------------------- #
 
 enable_dot() {
-    log "Enabling DNS over TLS in Unbound configuration..."
+    log "正在 Unbound 配置中启用 DNS over TLS..."
 
-    # Create a timestamped backup before modifying; store exact filename for
-    # safe restore if validation fails
+    # 修改前创建带时间戳的备份；保存精确文件名以便验证失败时安全回滚
     local backup_ts
     backup_ts="${UNBOUND_CONF}.bak.$(date +%Y%m%d%H%M%S)"
     cp "${UNBOUND_CONF}" "${backup_ts}"
 
-    # Uncomment the DoT interface directive
+    # 取消注释 DoT 接口指令
     sed -i "s|^    # interface: 0\.0\.0\.0@853$|    interface: 0.0.0.0@853|" \
         "${UNBOUND_CONF}"
 
-    # Uncomment and populate the TLS certificate directives
+    # 取消注释并填入 TLS 证书指令
     sed -i "s|^    # tls-service-key: .*$|    tls-service-key: \"${CERT_DIR}/privkey.pem\"|" \
         "${UNBOUND_CONF}"
     sed -i "s|^    # tls-service-pem: .*$|    tls-service-pem: \"${CERT_DIR}/fullchain.pem\"|" \
@@ -157,108 +156,108 @@ enable_dot() {
     sed -i "s|^    # tls-min-version: .*$|    tls-min-version: \"TLSv1.2\"|" \
         "${UNBOUND_CONF}"
 
-    # Verify the patched configuration is syntactically valid
+    # 验证修改后的配置语法是否正确
     if unbound-checkconf "${UNBOUND_CONF}"; then
-        log "Unbound configuration validated."
+        log "Unbound 配置验证通过。"
     else
-        warn "Unbound config validation failed — restoring backup."
+        warn "Unbound 配置验证失败 — 正在恢复备份。"
         cp "${backup_ts}" "${UNBOUND_CONF}" 2>/dev/null || true
-        die "DoT activation aborted. Fix the configuration manually."
+        die "DoT 启用已中止。请手动修复配置后重试。"
     fi
 
-    # Reload Unbound to apply the changes
+    # 重载 Unbound 以应用变更
     systemctl reload unbound
-    log "Unbound reloaded with DoT on port 853."
+    log "Unbound 已重载，DoT 在 853 端口生效。"
 }
 
 # --------------------------------------------------------------------------- #
-# Step 3 — Install automatic certificate renewal cron job
+# 步骤三 — 安装证书自动续期 cron 任务
 # --------------------------------------------------------------------------- #
 
 install_renewal_cron() {
-    log "Installing certificate auto-renewal cron job..."
+    log "正在安装证书自动续期 cron 任务..."
 
     cat > /etc/cron.d/certbot-renew-unbound <<CRON
-# Renew Let's Encrypt certificates daily; reload Unbound on success
-# Added by scripts/setup-tls.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# 每日续期 Let's Encrypt 证书；成功后重载 Unbound
+# 由 scripts/setup-tls.sh 于 $(date -u +%Y-%m-%dT%H:%M:%SZ) 添加
 0 3 * * * root certbot renew --quiet --deploy-hook "systemctl reload unbound"
 CRON
 
     chmod 644 /etc/cron.d/certbot-renew-unbound
-    log "Cron job installed at /etc/cron.d/certbot-renew-unbound"
+    log "cron 任务已安装至 /etc/cron.d/certbot-renew-unbound"
 }
 
 # --------------------------------------------------------------------------- #
-# Step 4 — Verify DoT is working
+# 步骤四 — 验证 DoT 是否正常工作
 # --------------------------------------------------------------------------- #
 
 verify_dot() {
-    log "Verifying DoT on port 853..."
+    log "正在验证 853 端口的 DoT..."
 
-    # Give Unbound a moment to bind the new socket
+    # 等待 Unbound 绑定新套接字
     sleep 2
 
     if command -v kdig &>/dev/null; then
         if kdig -d @127.0.0.1 +tls-ca +tls-host="${DOMAIN}" \
                 www.google.com A &>/dev/null; then
-            log "DoT verified successfully via kdig."
+            log "通过 kdig 验证 DoT 成功。"
         else
-            warn "kdig DoT test failed — check Unbound logs: journalctl -u unbound -n 50"
+            warn "kdig DoT 测试失败 — 请检查 Unbound 日志：journalctl -u unbound -n 50"
         fi
     else
-        # Fall back to openssl s_client
+        # 回退到 openssl s_client
         if echo | openssl s_client -connect "127.0.0.1:853" \
                 -servername "${DOMAIN}" &>/dev/null 2>&1; then
-            log "TLS handshake on port 853 successful."
+            log "853 端口 TLS 握手成功。"
         else
-            warn "TLS handshake test failed — check Unbound logs: journalctl -u unbound -n 50"
+            warn "TLS 握手测试失败 — 请检查 Unbound 日志：journalctl -u unbound -n 50"
         fi
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Summary
+# 部署摘要
 # --------------------------------------------------------------------------- #
 
 print_summary() {
     cat <<SUMMARY
 
 ${GREEN}=============================================================
-  DoT setup complete!
+  DoT 设置完成！
 =============================================================${NC}
 
-  Domain  : ${DOMAIN}
-  Cert dir: ${CERT_DIR}
-  DoT port: 853 (active)
+  域名    ：${DOMAIN}
+  证书目录：${CERT_DIR}
+  DoT端口 ：853（已激活）
 
-Test from your Qingdao client:
-  # Using kdig (knot-dnsutils)
-  kdig -d @<SERVER_IP> +tls-ca +tls-host=${DOMAIN} www.google.com
+从您的青岛客户端测试：
+  # 使用 kdig（knot-dnsutils）
+  kdig -d @<服务器IP> +tls-ca +tls-host=${DOMAIN} www.google.com
 
-  # Using systemd-resolved
-  resolvectl query --protocol=dot --server=<SERVER_IP> www.google.com
+  # 使用 systemd-resolved
+  resolvectl query --protocol=dot --server=<服务器IP> www.google.com
 
-Configure your DNS client:
-  - Android 9+:  Private DNS → ${DOMAIN}
-  - iOS 14+:     Settings → General → VPN & Device Management → DNS
-  - Windows:     PowerShell: Add-DnsClientDohServerAddress ...
-  - Linux (systemd-resolved):  DNS=${DOMAIN}  DNSOverTLS=yes
+配置您的 DNS 客户端：
+  - Android 9+：私人DNS → ${DOMAIN}
+  - iOS 14+：  设置 → 通用 → VPN与设备管理 → DNS
+  - Windows：  PowerShell: Add-DnsClientDohServerAddress ...
+  - Linux（systemd-resolved）：DNS=${DOMAIN}  DNSOverTLS=yes
 
-Certificate renewal:
-  Automatic renewal runs daily at 03:00 UTC via cron.
-  Manual renewal: certbot renew --deploy-hook "systemctl reload unbound"
+证书续期：
+  每日 03:00 UTC 通过 cron 自动续期。
+  手动续期：certbot renew --deploy-hook "systemctl reload unbound"
 
 SUMMARY
 }
 
 # --------------------------------------------------------------------------- #
-# Main
+# 主函数
 # --------------------------------------------------------------------------- #
 
 main() {
     require_root
 
-    log "Starting DoT setup for ${DOMAIN} on $(hostname) at $(date -u)"
+    log "于 $(date -u) 开始在 $(hostname) 上为 ${DOMAIN} 设置 DoT"
 
     preflight
     obtain_certificate

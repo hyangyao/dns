@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-# health-check.sh — Post-deployment verification and compliance check
+# health-check.sh — 部署后验证与合规检查
 #
-# Verifies that all services are running correctly and that the system meets
-# CIS Benchmark and PCI-DSS requirements.
+# 验证所有服务是否正常运行，并确认系统满足
+# CIS 基准和 PCI-DSS 要求。
 #
-# Usage:
+# 使用方法：
 #   sudo bash scripts/health-check.sh
 #
-# Exit code: 0 = all checks passed, 1 = one or more checks failed
+# 退出码：0 = 全部检查通过，1 = 一个或多个检查失败
 # =============================================================================
 
 set -uo pipefail
 IFS=$'\n\t'
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# 辅助函数
 # --------------------------------------------------------------------------- #
 
 RED='\033[0;31m'
@@ -28,62 +28,62 @@ PASS=0
 FAIL=0
 WARN=0
 
-pass() { echo -e "  ${GREEN}[PASS]${NC} $*"; (( PASS++ )) || true; }
-fail() { echo -e "  ${RED}[FAIL]${NC} $*"; (( FAIL++ )) || true; }
-warn() { echo -e "  ${YELLOW}[WARN]${NC} $*"; (( WARN++ )) || true; }
+pass() { echo -e "  ${GREEN}[通过]${NC} $*"; (( PASS++ )) || true; }
+fail() { echo -e "  ${RED}[失败]${NC} $*"; (( FAIL++ )) || true; }
+warn() { echo -e "  ${YELLOW}[警告]${NC} $*"; (( WARN++ )) || true; }
 header() { echo -e "\n${CYAN}▶ $*${NC}"; }
 
 require_root() {
-    [[ "$(id -u)" -eq 0 ]] || { echo "Run as root: sudo bash scripts/health-check.sh"; exit 1; }
+    [[ "$(id -u)" -eq 0 ]] || { echo "请以 root 身份运行：sudo bash scripts/health-check.sh"; exit 1; }
 }
 
 # --------------------------------------------------------------------------- #
-# Check 1 — Unbound service
+# 检查1 — Unbound 服务
 # --------------------------------------------------------------------------- #
 
 check_unbound_service() {
-    header "Unbound service"
+    header "Unbound 服务"
 
     if systemctl is-active --quiet unbound; then
-        pass "Unbound is running."
+        pass "Unbound 正在运行。"
     else
-        fail "Unbound is NOT running. Check: journalctl -u unbound -n 50"
+        fail "Unbound 未运行。请检查：journalctl -u unbound -n 50"
         return
     fi
 
     if systemctl is-enabled --quiet unbound; then
-        pass "Unbound is enabled at boot."
+        pass "Unbound 已设置为开机启动。"
     else
-        fail "Unbound is NOT enabled at boot."
+        fail "Unbound 未设置为开机启动。"
     fi
 
     if unbound-checkconf /etc/unbound/unbound.conf &>/dev/null; then
-        pass "Unbound configuration syntax is valid."
+        pass "Unbound 配置语法有效。"
     else
-        fail "Unbound configuration has syntax errors: unbound-checkconf /etc/unbound/unbound.conf"
+        fail "Unbound 配置存在语法错误：unbound-checkconf /etc/unbound/unbound.conf"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 2 — DNS resolution
+# 检查2 — DNS 解析
 # --------------------------------------------------------------------------- #
 
 check_dns_resolution() {
-    header "DNS resolution"
+    header "DNS 解析"
 
     if ! command -v dig &>/dev/null; then
-        warn "dig not found (install dnsutils). Skipping DNS resolution tests."
+        warn "未找到 dig（请安装 dnsutils）。跳过 DNS 解析测试。"
         return
     fi
 
-    # Plain UDP resolution
+    # 普通 UDP 解析
     if dig +short +timeout=5 @127.0.0.1 www.google.com A &>/dev/null; then
-        pass "Plain UDP DNS resolution to www.google.com: OK"
+        pass "普通 UDP DNS 解析 www.google.com：正常"
     else
-        fail "Plain UDP DNS resolution failed. Check Unbound logs."
+        fail "普通 UDP DNS 解析失败。请检查 Unbound 日志。"
     fi
 
-    # DNSSEC validation — sigfail.verteiltesysteme.net must return SERVFAIL
+    # DNSSEC 验证 — sigfail.verteiltesysteme.net 必须返回 SERVFAIL
     local result
     result="$(dig +short +timeout=5 @127.0.0.1 sigfail.verteiltesysteme.net A 2>/dev/null || true)"
     local rcode
@@ -91,89 +91,89 @@ check_dns_resolution() {
              | grep -oP 'NOERROR|SERVFAIL|NXDOMAIN|REFUSED' | head -1 || true)"
 
     if [[ "${rcode}" == "SERVFAIL" ]]; then
-        pass "DNSSEC validation: SERVFAIL correctly returned for invalid signature."
+        pass "DNSSEC 验证：对无效签名正确返回 SERVFAIL。"
     else
-        fail "DNSSEC validation: expected SERVFAIL, got '${rcode}'. DNSSEC may be misconfigured."
+        fail "DNSSEC 验证：期望 SERVFAIL，实际返回 '${rcode}'。DNSSEC 可能配置有误。"
     fi
 
-    # DNSSEC positive test — google.com should resolve with AD flag
+    # DNSSEC 正向测试 — google.com 应解析并带有 AD 标志
     local ad_flag
     ad_flag="$(dig +timeout=5 @127.0.0.1 google.com A 2>/dev/null \
                | grep -c 'flags:.*ad' || true)"
     if [[ "${ad_flag}" -gt 0 ]]; then
-        pass "DNSSEC AD flag present for google.com (validated response)."
+        pass "google.com 的 DNSSEC AD 标志存在（已验证的响应）。"
     else
-        warn "DNSSEC AD flag not present for google.com. May indicate DNSSEC not fully active."
+        warn "google.com 的 DNSSEC AD 标志不存在。可能表示 DNSSEC 未完全激活。"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 3 — Version hiding (CIS DNS 2.1 / PCI-DSS Req. 2)
+# 检查3 — 版本隐藏（CIS DNS 2.1 / PCI-DSS 要求2）
 # --------------------------------------------------------------------------- #
 
 check_version_hiding() {
-    header "Version & identity hiding (CIS DNS 2.1)"
+    header "版本与身份隐藏（CIS DNS 2.1）"
 
     if ! command -v dig &>/dev/null; then
-        warn "dig not found. Skipping version hiding tests."
+        warn "未找到 dig。跳过版本隐藏测试。"
         return
     fi
 
     local version_answer
     version_answer="$(dig +short @127.0.0.1 version.bind chaos txt 2>/dev/null || true)"
     if [[ -z "${version_answer}" ]]; then
-        pass "version.bind query returns empty (version hidden)."
+        pass "version.bind 查询返回为空（版本已隐藏）。"
     else
-        fail "version.bind returned: '${version_answer}' — set hide-version: yes in unbound.conf"
+        fail "version.bind 返回：'${version_answer}' — 请在 unbound.conf 中设置 hide-version: yes"
     fi
 
     local id_answer
     id_answer="$(dig +short @127.0.0.1 id.server chaos txt 2>/dev/null || true)"
     if [[ -z "${id_answer}" ]]; then
-        pass "id.server query returns empty (identity hidden)."
+        pass "id.server 查询返回为空（身份已隐藏）。"
     else
-        fail "id.server returned: '${id_answer}' — set hide-identity: yes in unbound.conf"
+        fail "id.server 返回：'${id_answer}' — 请在 unbound.conf 中设置 hide-identity: yes"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 4 — Access control (anti-amplification)
+# 检查4 — 访问控制（防放大攻击）
 # --------------------------------------------------------------------------- #
 
 check_access_control() {
-    header "Access control (anti-amplification)"
+    header "访问控制（防放大攻击）"
 
     if ! command -v dig &>/dev/null; then
-        warn "dig not found. Skipping access control tests."
+        warn "未找到 dig。跳过访问控制测试。"
         return
     fi
 
-    # Loopback must be allowed
+    # 回环地址必须被允许
     if dig +short +timeout=3 @127.0.0.1 www.google.com A &>/dev/null; then
-        pass "Loopback (127.0.0.1) queries are allowed."
+        pass "回环地址（127.0.0.1）查询被允许。"
     else
-        fail "Loopback queries are refused — check access-control in unbound.conf"
+        fail "回环地址查询被拒绝 — 请检查 unbound.conf 中的 access-control"
     fi
 
-    # Check that the default is 'refuse' in the config
+    # 检查配置中默认策略是否为 'refuse'
     if grep -q "access-control: 0\.0\.0\.0/0 refuse" /etc/unbound/unbound.conf; then
-        pass "Default access-control is 'refuse' (anti-amplification)."
+        pass "默认 access-control 为 'refuse'（防放大攻击）。"
     else
-        warn "Default access-control may not be 'refuse' — review unbound.conf"
+        warn "默认 access-control 可能不是 'refuse' — 请检查 unbound.conf"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 5 — UFW firewall (CIS 3.5 / PCI-DSS Req. 1)
+# 检查5 — UFW 防火墙（CIS 3.5 / PCI-DSS 要求1）
 # --------------------------------------------------------------------------- #
 
 check_ufw() {
-    header "UFW firewall (CIS 3.5 / PCI-DSS Req. 1)"
+    header "UFW 防火墙（CIS 3.5 / PCI-DSS 要求1）"
 
     if ufw status | grep -q "^Status: active"; then
-        pass "UFW is active."
+        pass "UFW 已激活。"
     else
-        fail "UFW is NOT active."
+        fail "UFW 未激活。"
         return
     fi
 
@@ -181,84 +181,84 @@ check_ufw() {
     ufw_rules="$(ufw status numbered)"
 
     for port_proto in "22/tcp" "53/tcp" "53/udp" "853/tcp" "443/tcp"; do
-        # Match both the port number and the protocol to avoid false positives
-        # (e.g. 22/udp open must not satisfy the 22/tcp check)
+        # 同时匹配端口号和协议，避免误判
+        # （例如：22/udp 已开放不应满足 22/tcp 的检查）
         if echo "${ufw_rules}" | grep -qE "\b${port_proto}\b"; then
-            pass "UFW allows port ${port_proto}."
+            pass "UFW 已开放端口 ${port_proto}。"
         else
-            fail "UFW missing rule for port ${port_proto}."
+            fail "UFW 缺少端口 ${port_proto} 的规则。"
         fi
     done
 
     if ufw status | grep -q "deny (incoming)"; then
-        pass "UFW default incoming policy is DENY."
+        pass "UFW 默认入站策略为 DENY。"
     else
-        fail "UFW default incoming policy is not DENY."
+        fail "UFW 默认入站策略不是 DENY。"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 6 — fail2ban (PCI-DSS Req. 8)
+# 检查6 — fail2ban（PCI-DSS 要求8）
 # --------------------------------------------------------------------------- #
 
 check_fail2ban() {
-    header "fail2ban (PCI-DSS Req. 8)"
+    header "fail2ban（PCI-DSS 要求8）"
 
     if systemctl is-active --quiet fail2ban; then
-        pass "fail2ban is running."
+        pass "fail2ban 正在运行。"
     else
-        fail "fail2ban is NOT running."
+        fail "fail2ban 未运行。"
         return
     fi
 
     if fail2ban-client status sshd &>/dev/null; then
-        pass "fail2ban sshd jail is active."
+        pass "fail2ban sshd 监狱已激活。"
     else
-        fail "fail2ban sshd jail is not active. Check /etc/fail2ban/jail.local"
+        fail "fail2ban sshd 监狱未激活。请检查 /etc/fail2ban/jail.local"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 7 — auditd (PCI-DSS Req. 10)
+# 检查7 — auditd（PCI-DSS 要求10）
 # --------------------------------------------------------------------------- #
 
 check_auditd() {
-    header "auditd (PCI-DSS Req. 10)"
+    header "auditd（PCI-DSS 要求10）"
 
     if systemctl is-active --quiet auditd; then
-        pass "auditd is running."
+        pass "auditd 正在运行。"
     else
-        fail "auditd is NOT running."
+        fail "auditd 未运行。"
         return
     fi
 
     if auditctl -l 2>/dev/null | grep -q "dns_config_changes"; then
-        pass "DNS config change audit rules are loaded."
+        pass "DNS 配置变更审计规则已加载。"
     else
-        warn "DNS config audit rules not found in kernel. Run: augenrules --load"
+        warn "内核中未找到 DNS 配置审计规则。请运行：augenrules --load"
     fi
 
     if auditctl -l 2>/dev/null | grep -q "root_commands"; then
-        pass "Root command execution audit rules are loaded."
+        pass "root 命令执行审计规则已加载。"
     else
-        warn "Root command audit rules not found. Run: augenrules --load"
+        warn "root 命令审计规则未找到。请运行：augenrules --load"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 8 — SSH hardening (CIS 5.2 / PCI-DSS Req. 8)
+# 检查8 — SSH 加固（CIS 5.2 / PCI-DSS 要求8）
 # --------------------------------------------------------------------------- #
 
 check_ssh() {
-    header "SSH hardening (CIS 5.2 / PCI-DSS Req. 8)"
+    header "SSH 加固（CIS 5.2 / PCI-DSS 要求8）"
 
     if systemctl is-active --quiet sshd; then
-        pass "sshd is running."
+        pass "sshd 正在运行。"
     else
-        fail "sshd is NOT running."
+        fail "sshd 未运行。"
     fi
 
-    # Read the effective sshd configuration
+    # 读取 sshd 的有效配置
     local sshd_effective
     sshd_effective="$(sshd -T 2>/dev/null || true)"
 
@@ -273,55 +273,55 @@ check_ssh() {
         local actual
         actual="$(echo "${sshd_effective}" | grep -i "^${key} " | awk '{print $2}' || true)"
         if [[ "${actual,,}" == "${expected[$key],,}" ]]; then
-            pass "sshd ${key}=${actual} (expected: ${expected[$key]})."
+            pass "sshd ${key}=${actual}（期望值：${expected[$key]}）。"
         else
-            fail "sshd ${key}='${actual}' — expected '${expected[$key]}'. Review sshd_config."
+            fail "sshd ${key}='${actual}' — 期望 '${expected[$key]}'。请检查 sshd_config。"
         fi
     done
 }
 
 # --------------------------------------------------------------------------- #
-# Check 9 — Kernel / network optimisation (BBR, sysctl)
+# 检查9 — 内核/网络优化（BBR、sysctl）
 # --------------------------------------------------------------------------- #
 
 check_sysctl() {
-    header "Kernel optimisation (BBR, sysctl)"
+    header "内核优化（BBR、sysctl）"
 
     local cc
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'unknown')"
     if [[ "${cc}" == "bbr" ]]; then
-        pass "BBR congestion control is active."
+        pass "BBR 拥塞控制已激活。"
     else
-        fail "BBR is NOT active (current: ${cc}). Check /etc/sysctl.d/99-dns-optimize.conf"
+        fail "BBR 未激活（当前：${cc}）。请检查 /etc/sysctl.d/99-dns-optimize.conf"
     fi
 
     local qdisc
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 'unknown')"
     if [[ "${qdisc}" == "fq" ]]; then
-        pass "Default qdisc is fq (required for BBR)."
+        pass "默认队列规则为 fq（BBR 所需）。"
     else
-        fail "Default qdisc is '${qdisc}' — should be 'fq' for BBR."
+        fail "默认队列规则为 '${qdisc}' — BBR 需要设置为 'fq'。"
     fi
 
     if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "0" ]]; then
-        pass "IP forwarding is disabled (CIS / PCI-DSS Req. 1)."
+        pass "IP 转发已禁用（CIS / PCI-DSS 要求1）。"
     else
-        fail "IP forwarding is ENABLED — disable it: sysctl net.ipv4.ip_forward=0"
+        fail "IP 转发已启用 — 请禁用：sysctl net.ipv4.ip_forward=0"
     fi
 
     if [[ "$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null)" == "1" ]]; then
-        pass "SYN cookies are enabled (CIS 3.3.2)."
+        pass "SYN Cookie 已启用（CIS 3.3.2）。"
     else
-        fail "SYN cookies are NOT enabled — set net.ipv4.tcp_syncookies=1"
+        fail "SYN Cookie 未启用 — 请设置 net.ipv4.tcp_syncookies=1"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 10 — Memory budget
+# 检查10 — 内存预算
 # --------------------------------------------------------------------------- #
 
 check_memory() {
-    header "Memory budget (1 GB RAM OOM prevention)"
+    header "内存预算（1 GB RAM 防内存溢出）"
 
     local total_mb
     total_mb="$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)"
@@ -329,118 +329,118 @@ check_memory() {
     avail_mb="$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo)"
     local used_mb=$(( total_mb - avail_mb ))
 
-    echo "    Total RAM : ${total_mb} MB"
-    echo "    Used      : ${used_mb} MB"
-    echo "    Available : ${avail_mb} MB"
+    echo "    总内存    ：${total_mb} MB"
+    echo "    已用      ：${used_mb} MB"
+    echo "    可用      ：${avail_mb} MB"
 
     if [[ "${avail_mb}" -gt 200 ]]; then
-        pass "Available memory (${avail_mb} MB) is above the 200 MB safety threshold."
+        pass "可用内存（${avail_mb} MB）高于 200 MB 安全阈值。"
     else
-        fail "Available memory (${avail_mb} MB) is LOW. Risk of OOM. Reduce cache sizes."
+        fail "可用内存（${avail_mb} MB）过低。存在内存溢出风险。请减小缓存大小。"
     fi
 
-    # Check Unbound cache configuration
+    # 检查 Unbound 缓存配置
     local msg_cache rrset_cache
     msg_cache="$(grep -oP '(?<=msg-cache-size:\s)\S+' /etc/unbound/unbound.conf 2>/dev/null || echo 'N/A')"
     rrset_cache="$(grep -oP '(?<=rrset-cache-size:\s)\S+' /etc/unbound/unbound.conf 2>/dev/null || echo 'N/A')"
-    echo "    Unbound msg-cache-size  : ${msg_cache}"
-    echo "    Unbound rrset-cache-size: ${rrset_cache}"
-    pass "Unbound cache sizes read from config (verify they are ≤192m total)."
+    echo "    Unbound msg-cache-size  ：${msg_cache}"
+    echo "    Unbound rrset-cache-size：${rrset_cache}"
+    pass "已从配置读取 Unbound 缓存大小（请确认合计不超过 192m）。"
 }
 
 # --------------------------------------------------------------------------- #
-# Check 11 — DoT status
+# 检查11 — DoT 状态
 # --------------------------------------------------------------------------- #
 
 check_dot() {
-    header "DNS over TLS (DoT) status"
+    header "DNS over TLS（DoT）状态"
 
     if ss -tlnp 2>/dev/null | grep -q ":853 "; then
-        pass "Unbound is listening on port 853 (DoT active)."
-        # Verify TLS cert paths exist
+        pass "Unbound 正在监听 853 端口（DoT 已激活）。"
+        # 验证 TLS 证书路径是否存在
         local key_path pem_path
         key_path="$(grep -oP '(?<=tls-service-key:\s")[^"]+' /etc/unbound/unbound.conf 2>/dev/null || true)"
         pem_path="$(grep -oP '(?<=tls-service-pem:\s")[^"]+' /etc/unbound/unbound.conf 2>/dev/null || true)"
         if [[ -f "${key_path:-/nonexistent}" ]]; then
-            pass "TLS private key exists: ${key_path}"
+            pass "TLS 私钥存在：${key_path}"
         else
-            fail "TLS private key NOT found: ${key_path}"
+            fail "TLS 私钥不存在：${key_path}"
         fi
         if [[ -f "${pem_path:-/nonexistent}" ]]; then
-            pass "TLS certificate exists: ${pem_path}"
+            pass "TLS 证书存在：${pem_path}"
         else
-            fail "TLS certificate NOT found: ${pem_path}"
+            fail "TLS 证书不存在：${pem_path}"
         fi
     else
-        warn "Unbound is NOT listening on port 853. DoT not yet enabled."
-        warn "To enable DoT, run: sudo bash scripts/setup-tls.sh <domain> <email>"
+        warn "Unbound 未在 853 端口监听。DoT 尚未启用。"
+        warn "启用 DoT 请运行：sudo bash scripts/setup-tls.sh <域名> <邮箱>"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Check 12 — DNSSEC root trust anchor
+# 检查12 — DNSSEC 根信任锚
 # --------------------------------------------------------------------------- #
 
 check_trust_anchor() {
-    header "DNSSEC root trust anchor"
+    header "DNSSEC 根信任锚"
 
     if [[ -f /var/lib/unbound/root.key ]]; then
         local key_age_days
         key_age_days=$(( ( $(date +%s) - $(stat -c %Y /var/lib/unbound/root.key) ) / 86400 ))
         if [[ "${key_age_days}" -lt 30 ]]; then
-            pass "root.key exists and is ${key_age_days} day(s) old."
+            pass "root.key 存在，距今 ${key_age_days} 天。"
         else
-            warn "root.key is ${key_age_days} days old. Consider refreshing: unbound-anchor -a /var/lib/unbound/root.key"
+            warn "root.key 已有 ${key_age_days} 天。建议刷新：unbound-anchor -a /var/lib/unbound/root.key"
         fi
     else
-        fail "root.key not found. Run: unbound-anchor -a /var/lib/unbound/root.key"
+        fail "root.key 不存在。请运行：unbound-anchor -a /var/lib/unbound/root.key"
     fi
 
     if [[ -f /var/lib/unbound/root.hints ]]; then
         local hints_age_days
         hints_age_days=$(( ( $(date +%s) - $(stat -c %Y /var/lib/unbound/root.hints) ) / 86400 ))
         if [[ "${hints_age_days}" -lt 90 ]]; then
-            pass "root.hints exists and is ${hints_age_days} day(s) old."
+            pass "root.hints 存在，距今 ${hints_age_days} 天。"
         else
-            warn "root.hints is ${hints_age_days} days old. Refresh: curl -sSo /var/lib/unbound/root.hints https://www.internic.net/domain/named.cache"
+            warn "root.hints 已有 ${hints_age_days} 天。请刷新：curl -sSo /var/lib/unbound/root.hints https://www.internic.net/domain/named.cache"
         fi
     else
-        fail "root.hints not found at /var/lib/unbound/root.hints"
+        fail "root.hints 不存在：/var/lib/unbound/root.hints"
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Summary
+# 汇总
 # --------------------------------------------------------------------------- #
 
 print_summary() {
     local total=$(( PASS + FAIL + WARN ))
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "  Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}  ${YELLOW}${WARN} warnings${NC}  (${total} total)"
+    echo -e "  结果：${GREEN}${PASS} 通过${NC}  ${RED}${FAIL} 失败${NC}  ${YELLOW}${WARN} 警告${NC}  （共 ${total} 项）"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     if [[ "${FAIL}" -gt 0 ]]; then
-        echo -e "  ${RED}Action required: review the FAIL items above before production use.${NC}"
+        echo -e "  ${RED}需要处理：请在投入生产前检查上述「失败」项目。${NC}"
         return 1
     elif [[ "${WARN}" -gt 0 ]]; then
-        echo -e "  ${YELLOW}Review warnings above. Deployment is functional but not fully optimised.${NC}"
+        echo -e "  ${YELLOW}请检查上述警告项目。部署可运行但尚未完全优化。${NC}"
         return 0
     else
-        echo -e "  ${GREEN}All checks passed. Server is ready for production use.${NC}"
+        echo -e "  ${GREEN}所有检查已通过。服务器可投入生产使用。${NC}"
         return 0
     fi
 }
 
 # --------------------------------------------------------------------------- #
-# Main
+# 主函数
 # --------------------------------------------------------------------------- #
 
 main() {
     require_root
 
     echo -e "${CYAN}================================================================"
-    echo "  DNS Server Health Check — $(hostname) — $(date -u)"
+    echo "  DNS 服务器健康检查 — $(hostname) — $(date -u)"
     echo -e "================================================================${NC}"
 
     check_unbound_service
